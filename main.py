@@ -1,9 +1,7 @@
-
-import sys, base64, lzma, zlib, hashlib, math
+import sys, base64, lzma, zlib, hashlib, math, bz2, re
 
 Z = [{"id": 33, "preset": 9, "nice_len": 128}]
-Q = 251                      # period of the kind-1 keystream
-
+Q = 251
 
 def fwd(p, e1):
     k = e1 & 7
@@ -17,7 +15,6 @@ def fwd(p, e1):
     if k == 5:
         return bytes((p[i] - (p[i - 1] if i else 0)) & 255 for i in range(len(p)))
     return p
-
 
 def inv(p, e1):
     k = e1 & 7
@@ -44,7 +41,6 @@ def inv(p, e1):
         return bytes(out)
     return p
 
-
 def chunks(d):
     o = 80
     r = []
@@ -54,17 +50,297 @@ def chunks(d):
         o += 14 + n
     return r
 
+CODECS = ("lzma", "lc0", "zlib", "bz2", "lc1")
+ZB = {"id": 33, "preset": 9, "nice_len": 128, "dict_size": 1 << 26}
 
-def add(out, x):
-    x = lzma.compress(x, format=3, filters=Z)
-    out.extend(len(x).to_bytes(4, "big"))
-    out.extend(x)
+def _z(lc):
+    f = dict(ZB)
+    f["lc"] = lc
+    f["lp"] = 0
+    f["pb"] = 0
+    return f
 
+ZF = dict(ZB)
+Z0 = _z(0)
+Z1 = _z(1)
+
+ZFIL = [ZF, Z0, None, None, Z1]
+
+def pack(x, c):
+    if c == 2:
+        return zlib.compress(x, 9)
+    if c == 3:
+        return bz2.compress(x, 9)
+    return lzma.compress(x, format=3, filters=[ZFIL[c]])
+
+def unpack(y, c):
+    if c == 2:
+        return zlib.decompress(y)
+    if c == 3:
+        return bz2.decompress(y)
+    return lzma.decompress(y, format=3, filters=[ZFIL[c]])
+
+def _sel_pack(x, c):
+    if c == 2:
+        return zlib.compress(x, 9)
+    if c == 3:
+        return bz2.compress(x, 9)
+    f = dict(ZFIL[c])
+    f["preset"] = 6
+    f["nice_len"] = 64
+    f["dict_size"] = 1 << 24
+    return lzma.compress(x, format=3, filters=[f])
+
+def choose_codec(blk):
+    n = len(blk)
+    if n <= 131072:
+        sample = blk
+    else:
+        w = min(262144, max(16384, n // 8))
+        sample = blk[:w] + blk[n // 2:n // 2 + w] + blk[n - w:]
+    best, bc = None, 0
+    for c in range(5):
+        try:
+            sz = len(_sel_pack(sample, c))
+        except Exception:
+            continue
+        if best is None or sz < best:
+            best, bc = sz, c
+    return bc
+
+L0RE = re.compile(r'^(\d+) (\d+)\.(\d+)\.(\d+)\.(\d+) "(\w+) (/[^?"]*)\?id=(\d+)"'
+                  r' (\d+) (\d+) (\d+)ms "([^/]+)/([^ ]+) \(([^)]*)\)"$')
+L1RE = re.compile(r'^(\d+),(\d+)\.(\d+)\.(\d+)\.(\d+),([^,]*),([^,]*),([^,]*)$')
+
+def vi(n, o):
+    while True:
+        b = n & 127
+        n >>= 7
+        o.append(b | 128 if n else b)
+        if not n:
+            return
+
+def vr(b, p):
+    n = 0
+    sh = 0
+    while True:
+        c = b[p]
+        p += 1
+        n |= (c & 127) << sh
+        if not c & 128:
+            return n, p
+        sh += 7
+
+def zvi(x, o):
+    vi((x << 1) if x >= 0 else ((-x << 1) - 1), o)
+
+def zvr(b, p):
+    v, p = vr(b, p)
+    return ((v >> 1) if not v & 1 else -((v + 1) >> 1)), p
+
+def en_dic(vals, o):
+    dic = sorted(set(vals))
+    o2 = {v: i for i, v in enumerate(dic)}
+    vi(len(dic), o)
+    for v in dic:
+        w = v.encode("latin1")
+        vi(len(w), o)
+        o += w
+    for v in vals:
+        vi(o2[v], o)
+
+def de_dic(b, p, k):
+    n, p = vr(b, p)
+    dic = []
+    for _ in range(n):
+        L, p = vr(b, p)
+        dic.append(b[p:p + L].decode("latin1"))
+        p += L
+    vals = []
+    for _ in range(k):
+        i, p = vr(b, p)
+        vals.append(dic[i])
+    return vals, p
+
+def _split_exc(text, rx):
+    lines = text.split("\n")
+    tail = lines.pop() if lines and lines[-1] == "" else None
+    rec = []
+    exc = []
+    for i, L in enumerate(lines):
+        m = rx.match(L)
+        if m:
+            rec.append((i, m.groups()))
+        else:
+            exc.append((i, L))
+    if not rec or len(rec) * 1000 < len(lines) * 997:
+        return None
+    return lines, tail, rec, exc
+
+def _head(o, n, rec, exc, tail):
+    vi(n, o)
+    mask = bytearray((n + 7) // 8)
+    for i, _ in rec:
+        mask[i >> 3] |= 1 << (i & 7)
+    o += mask
+    vi(len(exc), o)
+    for i, L in exc:
+        vi(i, o)
+        w = L.encode("latin1")
+        vi(len(w), o)
+        o += w
+    o.append(1 if tail is not None else 0)
+
+def _tail_par(buf, p):
+    n, p = vr(buf, p)
+    mask = buf[p:p + (n + 7) // 8]
+    p += (n + 7) // 8
+    ne, p = vr(buf, p)
+    exc = {}
+    for _ in range(ne):
+        i, p = vr(buf, p)
+        L, p = vr(buf, p)
+        exc[i] = buf[p:p + L].decode("latin1")
+        p += L
+    tl = buf[p]
+    p += 1
+    ok = [j for j in range(n) if mask[j >> 3] & (1 << (j & 7))]
+    return n, exc, ok, p, tl
+
+def _finish(n, exc, out, tail):
+    if tail:
+        out.append("")
+    return "\n".join(out)
+
+def logs0_pack(text):
+    sp = _split_exc(text, L0RE)
+    if sp is None:
+        return None
+    lines, tail, rec, exc = sp
+    o = bytearray()
+    _head(o, len(lines), rec, exc, tail)
+    ts = [int(g[0]) for _, g in rec]
+    prev = 0
+    for v in ts:
+        zvi(v - prev, o)
+        prev = v
+    for c in range(1, 5):
+        for _, g in rec:
+            vi(int(g[c]), o)
+    en_dic([g[5] for _, g in rec], o)
+    en_dic([g[6] for _, g in rec], o)
+    for _, g in rec:
+        vi(int(g[7]), o)
+    en_dic([g[8] for _, g in rec], o)
+    en_dic([g[9] for _, g in rec], o)
+    for _, g in rec:
+        vi(int(g[10]), o)
+    for c in (11, 12, 13):
+        en_dic([g[c] for _, g in rec], o)
+    return bytes(o)
+
+def logs0_unpack(buf):
+    n, exc, ok, p, tl = _tail_par(buf, 0)
+    k = len(ok)
+    ts = []
+    prev = 0
+    for _ in range(k):
+        v, p = zvr(buf, p)
+        prev += v
+        ts.append(prev)
+    cols = []
+    for _ in range(4):
+        col = []
+        for _ in range(k):
+            v, p = vr(buf, p)
+            col.append(v)
+        cols.append(col)
+    me, p = de_dic(buf, p, k)
+    pa, p = de_dic(buf, p, k)
+    q = []
+    for _ in range(k):
+        v, p = vr(buf, p)
+        q.append(v)
+    st, p = de_dic(buf, p, k)
+    sz, p = de_dic(buf, p, k)
+    ms = []
+    for _ in range(k):
+        v, p = vr(buf, p)
+        ms.append(v)
+    g1, p = de_dic(buf, p, k)
+    g2, p = de_dic(buf, p, k)
+    g3, p = de_dic(buf, p, k)
+    out = []
+    r = 0
+    for i in range(n):
+        if i in exc:
+            out.append(exc[i])
+        else:
+            out.append('%d %d.%d.%d.%d "%s %s?id=%d" %s %s %dms "%s/%s (%s)"' % (
+                ts[r], cols[0][r], cols[1][r], cols[2][r], cols[3][r], me[r], pa[r],
+                q[r], st[r], sz[r], ms[r], g1[r], g2[r], g3[r]))
+            r += 1
+    return _finish(n, exc, out, tl)
+
+def logs1_pack(text):
+    sp = _split_exc(text, L1RE)
+    if sp is None:
+        return None
+    lines, tail, rec, exc = sp
+    o = bytearray()
+    _head(o, len(lines), rec, exc, tail)
+    prev = 0
+    for _, g in rec:
+        v = int(g[0])
+        zvi(v - prev, o)
+        prev = v
+    for c in range(1, 5):
+        for _, g in rec:
+            vi(int(g[c]), o)
+    for c in (5, 6, 7):
+        en_dic([g[c] for _, g in rec], o)
+    return bytes(o)
+
+def logs1_unpack(buf):
+    n, exc, ok, p, tl = _tail_par(buf, 0)
+    k = len(ok)
+    ts = []
+    prev = 0
+    for _ in range(k):
+        v, p = zvr(buf, p)
+        prev += v
+        ts.append(prev)
+    ip = []
+    for _ in range(4):
+        col = []
+        for _ in range(k):
+            v, p = vr(buf, p)
+            col.append(v)
+        ip.append(col)
+    me, p = de_dic(buf, p, k)
+    va, p = de_dic(buf, p, k)
+    fl, p = de_dic(buf, p, k)
+    out = []
+    r = 0
+    for i in range(n):
+        if i in exc:
+            out.append(exc[i])
+        else:
+            out.append("%d,%d.%d.%d.%d,%s,%s,%s" % (
+                ts[r], ip[0][r], ip[1][r], ip[2][r], ip[3][r], me[r], va[r], fl[r]))
+            r += 1
+    return _finish(n, exc, out, tl)
+
+LOGS_PK = {0: logs0_pack, 1: logs1_pack}
+LOGS_UP = {0: logs0_unpack, 1: logs1_unpack}
 
 def take(a, o):
     n = int.from_bytes(a[o:o + 4], "big")
     return lzma.decompress(a[o + 4:o + 4 + n], format=3, filters=Z), o + 4 + n
 
+def take_c(a, o, c):
+    n = int.from_bytes(a[o:o + 4], "big")
+    return unpack(a[o + 4:o + 4 + n], c), o + 4 + n
 
 def _wht(a):
     n = len(a)
@@ -78,7 +354,6 @@ def _wht(a):
                 a[j] = x + y
                 a[j + h] = x - y
         h = st
-
 
 def ml_key(hp, hc):
     tot = sum(hp)
@@ -104,12 +379,10 @@ def ml_key(hp, hc):
         key[j] = bk
     return bytes(key)
 
-
 def unmask(p, k):
     n = len(p)
     kp = k * (n // Q + 1)
     return bytes(a ^ b for a, b in zip(p, kp))
-
 
 def lcg_lowbyte_key(ct, min_words=4 * Q):
     n = len(ct)
@@ -139,7 +412,6 @@ def lcg_lowbyte_key(ct, min_words=4 * Q):
                 return key
     return None
 
-
 def ve(v, m):
     a = [v]
     l = {}
@@ -148,7 +420,6 @@ def ve(v, m):
         a.append(i - l[x] if x in l else 0)
         l[x] = i
     return a
-
 
 def bm(a):
     C = B = 1
@@ -166,7 +437,6 @@ def bm(a):
                 m = N
     return C
 
-
 def sha_chain(seed, n):
     h = seed
     x = bytearray(seed[:n])
@@ -175,12 +445,10 @@ def sha_chain(seed, n):
         x += h
     return bytes(x[:n])
 
-
 M64 = (1 << 64) - 1
 XS_MUL = 0x2545F4914F6CDD1D
 LCG_A = 0x5851F42D4C957F2D
 LCG_C = 0x14057B7EF767814F
-
 
 def gen_lcg(seed, n):
     o = bytearray()
@@ -189,7 +457,6 @@ def gen_lcg(seed, n):
         o += s.to_bytes(8, "little")
         s = (LCG_A * s + LCG_C) & M64
     return bytes(o[:n])
-
 
 def gen_xs(seed, n):
     o = bytearray()
@@ -201,7 +468,6 @@ def gen_xs(seed, n):
         s &= M64
         o += (s * XS_MUL & M64).to_bytes(8, "little")
     return bytes(o[:n])
-
 
 def xs_unmix(o):
     x = (o * pow(XS_MUL, -1, 1 << 64)) & M64
@@ -215,7 +481,6 @@ def xs_unmix(o):
         z = y ^ (z >> 12)
     return z & M64
 
-
 def gen_rc(num):
     u = bytearray((0).to_bytes(4, "little"))
     s = {0}
@@ -226,7 +491,6 @@ def gen_rc(num):
         s.add(c)
         u += c.to_bytes(4, "little")
     return bytes(u)
-
 
 def gen_cl(num):
     mm = {1: 0}
@@ -243,13 +507,11 @@ def gen_cl(num):
         r += mm[n].to_bytes(4, "little")
     return bytes(r)
 
-
 def a181_ve(val, n):
     num = n // 4
     u = ve(val, num + 1)
     return val.to_bytes(4, "little") + b"".join(
         x.to_bytes(4, "little") for x in u[1:num])
-
 
 def a181_diff(val, n):
     num = n // 4
@@ -258,13 +520,11 @@ def a181_diff(val, n):
     return (-val).to_bytes(4, "little", signed=True) + b"".join(
         x.to_bytes(4, "little", signed=True) for x in d)
 
-
 def a181_u16(val, n):
     num = (n - 4) // 2
     u = ve(val, num + 5)
     return val.to_bytes(4, "little") + b"".join(
         (x & 65535).to_bytes(2, "little") for x in u[2:num + 2])
-
 
 def a181_bits(val, n):
     num = (n - 4) // 3
@@ -281,7 +541,6 @@ def a181_bits(val, n):
     g.extend([((lt & 15) << 4) | ((t[num * 2 - 1] >> 8) & 15), (lt >> 4) & 255])
     return bytes(g)
 
-
 def a181_gen(fam, val, n):
     if fam == 0:
         return a181_ve(val, n)
@@ -290,7 +549,6 @@ def a181_gen(fam, val, n):
     if fam == 2:
         return a181_bits(val, n)
     return a181_diff(val, n)
-
 
 def ca_rows(rule, seed, nrows):
     M = (1 << 2048) - 1
@@ -313,10 +571,8 @@ def ca_rows(rule, seed, nrows):
         rows += cur
     return bytes(rows)
 
-
 def ca_match(data, rule, nrows=24):
     return ca_rows(rule, data[:256], nrows) == data[:256 * nrows]
-
 
 CA_RULES = (30, 45, 90, 105, 110, 150)
 
@@ -327,9 +583,7 @@ def cnst_gen(e0, n, ramp):
         x = bytes((v + i) & 255 for i, v in enumerate(x))
     return x[:n]
 
-
 MT_N, MT_M = 624, 227
-
 
 def lpred(q, B):
     y = 0
@@ -339,7 +593,6 @@ def lpred(q, B):
         q ^= v[0]
         y ^= v[1]
     return y
-
 
 def mt_tables(B):
     T = []
@@ -351,7 +604,6 @@ def mt_tables(B):
                 t[v] = t[v - lb] ^ lpred(1 << (32 * wi + 8 * p + lb.bit_length() - 1), B)
             T.append(t)
     return T
-
 
 def mt_gen(words, nw, T):
     t0, t1, t2, t3, t4, t5, t6, t7 = T[0], T[1], T[2], T[3], T[4], T[5], T[6], T[7]
@@ -367,7 +619,6 @@ def mt_gen(words, nw, T):
                      ^ t8[c & 255] ^ t9[(c >> 8) & 255] ^ ta[(c >> 16) & 255] ^ tb[c >> 24]
                      ^ tc[d & 255] ^ td[(d >> 8) & 255] ^ te[(d >> 16) & 255] ^ tf[d >> 24])
     return words
-
 
 def mt_fit_check(payload):
     nw = len(payload) // 4
@@ -398,7 +649,6 @@ def mt_fit_check(payload):
             return None
     return B
 
-
 T_RESID, T_SHA, T_LCG, T_XS, T_A181, T_CA, _UNUSED, T_MT1, T_TOC, T_REF, \
     T_FPLAN, T_RC, T_CL, T_MT4R, T_CNST, T_CNST1 = range(16)
 
@@ -422,7 +672,6 @@ FPLAN_KEYS = tuple(FPLAN)
 MT_L1 = 20188
 MT_CW = (MT_L1 + 8) // 8
 
-
 def delta(a, b, k):
     if k == 1:
         return bytes(x ^ y for x, y in zip(a, b))
@@ -430,15 +679,12 @@ def delta(a, b, k):
         return bytes((x - y) & 255 for x, y in zip(a, b))
     return bytes((y - x) & 255 for x, y in zip(a, b))
 
-
 def undelta(d, b, k):
     if k == 1:
         return bytes(x ^ y for x, y in zip(d, b))
     if k == 2:
         return bytes((x + y) & 255 for x, y in zip(d, b))
     return bytes((y - x) & 255 for x, y in zip(d, b))
-
-
 
 XT_NAMES = ("raw", "lane2", "lane3", "lane4", "lane5", "lane6", "lane7",
             "lane8", "lane12", "lane16", "lane24", "lane32",
@@ -449,10 +695,8 @@ XT_NAMES = ("raw", "lane2", "lane3", "lane4", "lane5", "lane6", "lane7",
             "lane3d1", "lane4d1", "lane2d1", "lane3x1")
 XT_DELTA = ("d1", "d2", "d3", "d4", "lane3d1", "lane4d1", "lane2d1")
 
-
 def x_lane(b, w):
     return b"".join(b[i::w] for i in range(w))
-
 
 def x_unlane(b, w):
     n = len(b)
@@ -464,15 +708,12 @@ def x_unlane(b, w):
         q += m
     return bytes(out)
 
-
 def x_xor(b, L):
     A = int.from_bytes(b, "big")
     return ((A ^ (A << (8 * L))) >> (8 * L)).to_bytes(len(b), "big")
 
-
 def x_delta(b, L):
     return b[:L] + bytes((b[i] - b[i - L]) & 255 for i in range(L, len(b)))
-
 
 def x_undelta(b, L):
     n = len(b)
@@ -481,14 +722,12 @@ def x_undelta(b, L):
         out[i] = (b[i] + out[i - L]) & 255
     return bytes(out)
 
-
 def x_uxor(b, L):
     n = len(b)
     out = bytearray(b)
     for i in range(L, n):
         out[i] = b[i] ^ out[i - L]
     return bytes(out)
-
 
 def xfwd(b, k):
     nm = XT_NAMES[k]
@@ -506,7 +745,6 @@ def xfwd(b, k):
         return x_xor(b, int(nm[1:]))
     return x_delta(b, int(nm[1:]))
 
-
 def xbwd(b, k):
     nm = XT_NAMES[k]
     if nm == "raw":
@@ -522,10 +760,8 @@ def xbwd(b, k):
         return x_uxor(b, int(nm[1:]))
     return x_undelta(b, int(nm[1:]))
 
-
 def xscore(b):
     return len(zlib.compress(b, 6))
-
 
 def xpick(blk):
     n = len(blk)
@@ -546,7 +782,6 @@ def xpick(blk):
         if best is None or sc < best:
             best, bk = sc, k
     return bk
-
 
 def compress(src, dst):
     d = base64.b64decode(open(src, "rb").read())
@@ -668,7 +903,7 @@ def compress(src, dst):
     for i, c in enumerate(cs):
         if c[0] != b"MTST" or tag[i] != T_RESID or c[3] % 4:
             continue
-        raw = inv(c[4], c[2])              # the fitted law lives in raw space
+        raw = inv(c[4], c[2])
         B = mt_fit_check(raw)
         if B is None:
             continue
@@ -746,11 +981,25 @@ def compress(src, dst):
 
     for k in sorted(rg):
         ids = rg[k]
-        ids.sort(key=lambda i: (cs[i][1], i), reverse=True)
-        parts = [cs[i][4] for i in ids]
-        ks = pick_parts(parts)
-        xchoices += bytes(ks)
-        gblocks.append(encode_parts(parts, ks))
+        tot = sum(cs[i][3] for i in ids)
+        subs = sorted(set(cs[i][1] for i in ids)) if (
+            len(ids) >= 16 and tot >= (1 << 20)) else [None]
+        for e in subs:
+            sub = [i for i in ids if e is None or cs[i][1] == e]
+            sub.sort(key=lambda i: (cs[i][1], i), reverse=True)
+            parts = [cs[i][4] for i in sub]
+            if k[0] == b"LOGS" and e in LOGS_PK:
+                txt = b"".join(parts).decode("latin1")
+                md = LOGS_PK[e](txt)
+                if (md is not None and LOGS_UP[e](md) == txt and
+                        len(zlib.compress(md, 6)) < len(
+                            zlib.compress(txt.encode("latin1"), 6))):
+                    xchoices.append(255)
+                    gblocks.append(md)
+                    continue
+            ks = pick_parts(parts)
+            xchoices += bytes(ks)
+            gblocks.append(encode_parts(parts, ks))
     for g in FPLAN_KEYS:
         ids = [i for i, c in enumerate(cs)
                if c[0] == g[0] and c[3] == g[1] and tag[i] == T_FPLAN]
@@ -763,9 +1012,12 @@ def compress(src, dst):
             if code != 255:
                 x = delta(x, cs[ids[code & 31]][4], code >> 5)
             parts.append(x)
-        ks = pick_parts(parts)
-        xchoices += bytes(ks)
-        gblocks.append(encode_parts(parts, ks))
+        subs = sorted(set(cs[i][1] for i in ids)) if len(ids) >= 16 else [None]
+        for e in subs:
+            sub = [j for j, i in enumerate(ids) if e is None or cs[i][1] == e]
+            ks = pick_parts([parts[j] for j in sub])
+            xchoices += bytes(ks)
+            gblocks.append(encode_parts([parts[j] for j in sub], ks))
     hd += bytes(xchoices) + len(xchoices).to_bytes(4, "big")
 
     mtb = bytearray()
@@ -774,16 +1026,16 @@ def compress(src, dst):
     for i in mt4r:
         mtb += inv(cs[i][4], cs[i][2])[:2496]
 
-    add(out, meta)
-    add(out, bytes(tag))
-    add(out, bytes(hd))
-    add(out, bytes(keytab))
-    add(out, bytes(mtb))
-    for blk in gblocks:
-        add(out, blk)
+    stream = [meta, bytes(tag), bytes(hd), bytes(keytab), bytes(mtb)] + list(gblocks)
+    cc = [choose_codec(b) for b in stream]
+    out.extend(len(stream).to_bytes(2, "big"))
+    out.extend(bytes(cc))
+    for b, c in zip(stream, cc):
+        y = pack(b, c)
+        out.extend(len(y).to_bytes(4, "big"))
+        out.extend(y)
 
     open(dst, "wb").write(out)
-
 
 def _ref_build(r, n, op):
     if op == 0:
@@ -794,20 +1046,23 @@ def _ref_build(r, n, op):
         return bytes((r[j] + j) & 255 for j in range(n))
     return bytes(b ^ 0x5A for b in r[:n])
 
-
 def decompress(src, dst):
     a = open(src, "rb").read()
-    meta, o = take(a, 0)
+    nblk = int.from_bytes(a[0:2], "big")
+    cc = list(a[2:2 + nblk])
+    o = 2 + nblk
+    meta, o = take_c(a, o, cc[0])
     hdr = meta[:80]
     cs = []
     for q in range(80, len(meta), 10):
         n = int.from_bytes(meta[q:q + 4], "big")
         cs.append([meta[q + 4:q + 8], meta[q + 8], meta[q + 9], n, None])
     nc = len(cs)
-    tags, o = take(a, o)
-    hd, o = take(a, o)
-    keytab, o = take(a, o)
-    mtb, o = take(a, o)
+    tags, o = take_c(a, o, cc[1])
+    hd, o = take_c(a, o, cc[2])
+    keytab, o = take_c(a, o, cc[3])
+    mtb, o = take_c(a, o, cc[4])
+    bi = 5
 
     p = 0
     nf = int.from_bytes(hd[p:p + 2], "big")
@@ -865,7 +1120,7 @@ def decompress(src, dst):
     mt4ids = [i for i in range(nc) if tags[i] == T_MT4R]
     rawmode = set()
     base = 0
-    for i in mt1ids:                      # bit-level LFSR from stored taps
+    for i in mt1ids:
         n = cs[i][3]
         e = mtb[base:base + 4 * MT_L1]
         base += 4 * MT_L1
@@ -883,7 +1138,7 @@ def decompress(src, dst):
                 j += 1
             x[k::4] = y
         cs[i][4] = bytes(x)
-    if mt4ids:                            # raw-space MT state stream
+    if mt4ids:
         T = mt_tables(basis)
         for i in mt4ids:
             n = cs[i][3]
@@ -893,7 +1148,6 @@ def decompress(src, dst):
                        n // 4, T)
             cs[i][4] = b"".join(v.to_bytes(4, "big") for v in w[:n // 4])
             rawmode.add(i)
-
 
     refs = []
     for i in range(nc):
@@ -931,8 +1185,8 @@ def decompress(src, dst):
         elif t == T_TOC:
             r = bytearray((80).to_bytes(4, "big"))
             cur = 80
-            for cc in cs[:-1]:
-                cur += 14 + cc[3]
+            for cx in cs[:-1]:
+                cur += 14 + cx[3]
                 r += cur.to_bytes(4, "big")
             cs[i][4] = bytes(r)
 
@@ -944,10 +1198,24 @@ def decompress(src, dst):
     xi = 0
     for k in sorted(rg):
         ids = rg[k]
-        ids.sort(key=lambda i: (cs[i][1], i), reverse=True)
-        x, o = take(a, o)
-        q = 0
-        for i in ids:
+        tot = sum(cs[i][3] for i in ids)
+        subs = sorted(set(cs[i][1] for i in ids)) if (
+            len(ids) >= 16 and tot >= (1 << 20)) else [None]
+        for e in subs:
+          sub = [i for i in ids if e is None or cs[i][1] == e]
+          sub.sort(key=lambda i: (cs[i][1], i), reverse=True)
+          x, o = take_c(a, o, cc[bi])
+          bi += 1
+          q = 0
+          if k[0] == b"LOGS" and e in LOGS_UP and xi < ng and xtab[xi] == 255:
+            xi += 1
+            txt = LOGS_UP[e](x).encode("latin1")
+            for i in sub:
+                n = cs[i][3]
+                cs[i][4] = txt[q:q + n]
+                q += n
+            continue
+          for i in sub:
             n = cs[i][3]
             cs[i][4] = xbwd(x[q:q + n], xtab[xi])
             xi += 1
@@ -961,10 +1229,16 @@ def decompress(src, dst):
             continue
         cnt, plan = fplans[fi]
         fi += 1
-        x, o = take(a, o)
         n = g[1]
-        raw = [xbwd(x[j * n:(j + 1) * n], xtab[xi + j]) for j in range(cnt)]
-        xi += cnt
+        subs = sorted(set(cs[i][1] for i in ids)) if len(ids) >= 16 else [None]
+        raw = [None] * cnt
+        for e in subs:
+            sub = [j for j, i in enumerate(ids) if e is None or cs[i][1] == e]
+            x, o = take_c(a, o, cc[bi])
+            bi += 1
+            for jj, j in enumerate(sub):
+                raw[j] = xbwd(x[jj * n:(jj + 1) * n], xtab[xi])
+                xi += 1
         done = [None] * cnt
 
         def get(j):
@@ -989,7 +1263,6 @@ def decompress(src, dst):
             raise ValueError("unresolvable reference cycle")
         todo = nxt
 
-
     for i in range(nc):
         g = (cs[i][0], cs[i][3])
         if cs[i][2] & 7 == 1 and g in gkeys:
@@ -1003,7 +1276,6 @@ def decompress(src, dst):
         crc = zlib.crc32(c[0] + bytes((c[1], c[2])) + c[4]).to_bytes(4, "big")
         out_d += c[3].to_bytes(4, "big") + c[0] + bytes((c[1], c[2])) + c[4] + crc
     open(dst, "wb").write(base64.b64encode(out_d))
-
 
 if __name__ == "__main__":
     (compress if sys.argv[1] == "--compress" else decompress)(sys.argv[2], sys.argv[3])
