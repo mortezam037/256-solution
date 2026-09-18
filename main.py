@@ -297,8 +297,10 @@ def logs1_pack(text):
     for c in range(1, 5):
         for _, g in rec:
             vi(int(g[c]), o)
-    for c in (5, 6, 7):
-        en_dic([g[c] for _, g in rec], o)
+    en_dic([g[5] for _, g in rec], o)
+    for _, g in rec:
+        vi(int(g[6].replace(".", "")), o)
+    en_dic([g[7] for _, g in rec], o)
     return bytes(o)
 
 def logs1_unpack(buf):
@@ -318,7 +320,11 @@ def logs1_unpack(buf):
             col.append(v)
         ip.append(col)
     me, p = de_dic(buf, p, k)
-    va, p = de_dic(buf, p, k)
+    va = []
+    for _ in range(k):
+        v, p = vr(buf, p)
+        s = str(v).zfill(4)
+        va.append(s[:-3] + "." + s[-3:])
     fl, p = de_dic(buf, p, k)
     out = []
     r = 0
@@ -661,7 +667,7 @@ REF_TABLE = (
 )
 
 FPLAN = {
-    (b"IMG ", 655360): bytes.fromhex("ff202121ff2420222728252aff2b2424"),
+    (b"IMG ", 655360): bytes.fromhex("ff202121ff24ff222728252aff2b2424"),
     (b"DUP ", 174784): bytes.fromhex("ff2affffffffff26ffffff"),
     (b"WAVE", 131090): bytes.fromhex("ffffff212124ff2327"),
     (b"SEQ2", 174784): bytes.fromhex("64ff2421ffff"),
@@ -691,9 +697,8 @@ XT_NAMES = ("raw", "lane2", "lane3", "lane4", "lane5", "lane6", "lane7",
             "x1", "x2", "x3", "x4", "x6", "x8", "x12", "x16", "x32", "x64",
             "x128", "x256", "x512", "x1024", "x2048", "x4096", "x8192",
             "x16384", "x32768",
-            "d1", "d2", "d3", "d4", "d6", "d8", "d12",
+            "d1", "d2", "d3", "d4", "d6", "d8", "d12", "d2048",
             "lane3d1", "lane4d1", "lane2d1", "lane3x1")
-XT_DELTA = ("d1", "d2", "d3", "d4", "lane3d1", "lane4d1", "lane2d1")
 
 def x_lane(b, w):
     return b"".join(b[i::w] for i in range(w))
@@ -926,6 +931,8 @@ def compress(src, dst):
             if cnst_gen(c[1], c[3], ramp) == c[4]:
                 tag[i] = t
                 break
+
+# SEQ2 handled by FPLAN
 
     fplan = []
     for g in FPLAN_KEYS:
@@ -1182,6 +1189,7 @@ def decompress(src, dst):
         elif t == T_REF:
             refs.append((i, body[off], body[off + 1]))
             off += 2
+
         elif t == T_TOC:
             r = bytearray((80).to_bytes(4, "big"))
             cur = 80
